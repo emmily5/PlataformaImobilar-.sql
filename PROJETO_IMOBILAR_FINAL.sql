@@ -434,3 +434,425 @@ CREATE or replace TRIGGER trg_similaridade_proposta
 AFTER INSERT ON Proposta
 FOR EACH ROW
 EXECUTE FUNCTION verificar_similaridade_proposta();
+
+
+-- Calcular similaridade contrato -> anuncio
+CREATE OR REPLACE FUNCTION mostrar_similaridade_contrato()
+RETURNS TRIGGER AS $$
+DECLARE
+    grau_similaridade NUMERIC;
+    descricao_anuncio TEXT;
+    contrato_info TEXT;
+BEGIN
+    IF NEW.isFinalizado = TRUE AND OLD.isFinalizado = FALSE THEN
+        -- descrição do anúncio
+        SELECT a.descricaoAnuncio INTO descricao_anuncio
+        FROM Proposta p
+        JOIN Anuncio a ON a.idAnuncio = p.idAnuncio
+        WHERE p.idProposta = NEW.idProposta;
+
+        --  contrato (tipo + valor)
+        contrato_info := CONCAT(NEW.tipoContrato, NEW.valorFinal);
+ 
+ 		SELECT similarity(descricao_anuncio, contrato_info) INTO grau_similaridade;
+    	RAISE NOTICE 'Similaridade entre contrato e anúncio : %.', 
+        	grau_similaridade;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_mostrar_similaridade_contrato
+AFTER UPDATE ON Contrato
+FOR EACH ROW
+EXECUTE FUNCTION mostrar_similaridade_contrato();
+
+
+--PRA O CLIENTE AVALIAR O ANUNCIANTE 
+CREATE OR REPLACE FUNCTION criar_avaliacao_vazia()
+RETURNS TRIGGER AS $$
+DECLARE
+    novo_id INTEGER;
+BEGIN
+    -- Gerar novo id (se não usar SERIAL ou IDENTITY)
+    SELECT COALESCE(MAX(idAvaliacaoFinal), 0) + 1 INTO novo_id FROM AvaliacaoFinal;
+
+    -- Inserir avaliação com campos vazios e data atual
+    INSERT INTO AvaliacaoFinal (idAvaliacaoFinal, idProposta, nota, comentario, dataAvaliacao)
+    VALUES (novo_id, NEW.idProposta, NULL, NULL, CURRENT_DATE);
+
+    RAISE NOTICE 'Avaliação em aberto criada';
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+CREATE or replace TRIGGER trg_criar_avaliacao_vazia
+AFTER INSERT ON Contrato
+FOR EACH ROW
+EXECUTE FUNCTION criar_avaliacao_vazia();
+
+
+-- Validar proprietário do contrato
+CREATE OR REPLACE FUNCTION verificar_anunciante_imovel()
+RETURNS TRIGGER AS $$
+DECLARE
+    id_anunciante_imovel INTEGER;
+BEGIN
+    SELECT idAnunciante INTO id_anunciante_imovel
+    FROM Imovel
+    WHERE idImovel = NEW.idImovel;
+
+    -- Comparar com o anunciante informado no anúncio
+    IF NEW.idAnunciante IS DISTINCT FROM id_anunciante_imovel THEN
+        RAISE EXCEPTION 'O anunciante do anúncio (%), não é o mesmo do imóvel (%)', 
+            NEW.idAnunciante, id_anunciante_imovel;
+    END IF;
+
+    RAISE NOTICE 'Anunciante validado: imóvel e anúncio com mesmo anunciante (%).', NEW.idAnunciante;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER trg_verificar_anunciante_imovel
+BEFORE INSERT OR UPDATE ON Anuncio
+FOR EACH ROW
+EXECUTE FUNCTION verificar_anunciante_imovel();
+
+
+-- Função para atualizar disponibilidade do imóvel 
+CREATE OR REPLACE FUNCTION atualizar_disponibilidade_imovel()
+RETURNS TRIGGER AS $$
+DECLARE
+    id_imovel_alvo INTEGER;
+BEGIN
+    -- Verificar se o contrato foi finalizado
+    IF NEW.isFinalizado THEN
+        -- Obter o ID do imóvel relacionado ao contrato
+        SELECT a.idImovel INTO id_imovel_alvo
+        FROM Proposta p
+        JOIN Anuncio a ON p.idAnuncio = a.idAnuncio
+        WHERE p.idProposta = NEW.idProposta;
+
+        -- Atualizar a disponibilidade do imóvel para FALSE (indisponível)
+        UPDATE Imovel 
+        SET isDisponivel = FALSE 
+        WHERE idImovel = id_imovel_alvo;
+        
+        RAISE NOTICE 'Disponibilidade do imóvel ID % atualizada para indisponível devido ao contrato finalizado', id_imovel_alvo;
+    ELSE
+        RAISE NOTICE 'Contrato não finalizado - disponibilidade do imóvel mantida';
+    END IF;
+    
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER trg_atualizar_disponibilidade_imovel
+AFTER INSERT OR UPDATE ON Contrato
+FOR EACH ROW
+EXECUTE FUNCTION atualizar_disponibilidade_imovel();
+
+
+-- Impedir contratos duplicados 
+CREATE OR REPLACE FUNCTION impedir_contratos_duplicados()
+RETURNS TRIGGER AS $$
+DECLARE
+    id_imovel_alvo INTEGER;
+    existe_contrato_ativo INTEGER;
+    imovel_disponivel BOOLEAN;
+BEGIN
+    -- Obtém o ID do imóvel e sua disponibilidade
+    SELECT 
+        a.idImovel, 
+        i.isDisponivel 
+    INTO 
+        id_imovel_alvo,
+        imovel_disponivel
+    FROM Proposta p
+    JOIN Anuncio a ON p.idAnuncio = a.idAnuncio
+    JOIN Imovel i ON a.idImovel = i.idImovel
+    WHERE p.idProposta = NEW.idProposta;
+
+    -- Verifica se o imóvel está disponível
+    IF NOT imovel_disponivel THEN
+        RAISE EXCEPTION 'Não é possível criar contrato. O imóvel ID % não está disponível.', id_imovel_alvo;
+    END IF;
+
+    -- Verifica se já existe contrato ativo para o mesmo imóvel
+    SELECT COUNT(*) INTO existe_contrato_ativo
+    FROM Contrato c
+    JOIN Proposta p ON p.idProposta = c.idProposta
+    JOIN Anuncio a ON p.idAnuncio = a.idAnuncio
+    WHERE a.idImovel = id_imovel_alvo AND c.isFinalizado = FALSE;
+
+    IF existe_contrato_ativo > 0 THEN
+        RAISE EXCEPTION 'Já existe um contrato ativo para este imóvel (ID: %).', id_imovel_alvo;
+    END IF;
+    
+    RAISE NOTICE 'Verificação concluída: imóvel ID % está disponível e sem contratos ativos.', id_imovel_alvo;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_impedir_contratos_duplicados
+BEFORE INSERT ON Contrato
+FOR EACH ROW
+EXECUTE FUNCTION impedir_contratos_duplicados();
+
+-- Validar data do aluguel
+CREATE OR REPLACE FUNCTION validar_data_aluguel()
+RETURNS TRIGGER AS $$
+DECLARE
+    data_contrato DATE;
+BEGIN
+    SELECT dataFinalizacao INTO data_contrato
+    FROM Contrato
+    WHERE idContrato = NEW.idContrato;
+
+    -- Validar se a data de fim do aluguel é anterior à do contrato
+    IF NEW.dataFim < data_contrato THEN
+        RAISE EXCEPTION 'A data de fim do aluguel (%), não pode ser anterior à data de finalização do contrato (%).', NEW.dataFim, data_contrato;
+    END IF;
+
+    RAISE NOTICE 'Data do aluguel validada com sucesso: dataFim = %, dataFinalizacao = %', NEW.dataFim, data_contrato;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE or replace TRIGGER trg_validar_data_aluguel
+BEFORE INSERT OR UPDATE ON Aluguel
+FOR EACH ROW
+EXECUTE FUNCTION validar_data_aluguel();
+
+-- Validar tipo de contrato (Aluguel/Venda)
+CREATE OR REPLACE FUNCTION validar_tipo_contrato()
+RETURNS TRIGGER AS $$
+DECLARE
+    tipo_contrato VARCHAR;
+BEGIN
+    -- Obter o tipo de contrato da tabela Contrato
+    SELECT c.tipoContrato INTO tipo_contrato
+    FROM Contrato c
+    WHERE c.idContrato = NEW.idContrato;
+    
+    -- Verificar consistência para Aluguel
+    IF TG_TABLE_NAME = 'aluguel' AND tipo_contrato != 'Aluguel' THEN
+        RAISE EXCEPTION 'Tipo de contrato inconsistente. Esperado: Aluguel, Encontrado: %', tipo_contrato;
+    END IF;
+    
+    -- Verificar consistência para Venda
+    IF TG_TABLE_NAME = 'venda' AND tipo_contrato != 'Venda' THEN
+        RAISE EXCEPTION 'Tipo de contrato inconsistente. Esperado: Venda, Encontrado: %', tipo_contrato;
+    END IF;
+    
+    RAISE NOTICE 'Tipo de contrato validado com sucesso para % (Tipo: %)', TG_TABLE_NAME, tipo_contrato;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_validar_tipo_aluguel
+BEFORE INSERT OR UPDATE ON Aluguel
+FOR EACH ROW
+EXECUTE FUNCTION validar_tipo_contrato();
+CREATE TRIGGER trg_validar_tipo_venda
+BEFORE INSERT OR UPDATE ON Venda
+FOR EACH ROW
+EXECUTE FUNCTION validar_tipo_contrato();
+
+
+
+--VIEWS
+
+-- CALCULA E MOSTRA AS NOTAS DOS ANUNCIANTES
+-- CAMPO CALCULAVEL 
+CREATE OR REPLACE VIEW vw_reputacao_anunciante AS
+SELECT 
+  pa.idPerfil_Anunciante,
+  u.nome AS nomeAnunciante,
+  COUNT(af.idAvaliacaoFinal) AS totalAvaliacoes,
+  ROUND(AVG(af.nota)::numeric, 2) AS reputacao_atual
+FROM Perfil_Anunciante pa
+JOIN Usuario u ON u.idUsuario = pa.idUsuario
+JOIN Imovel i ON i.idAnunciante = pa.idPerfil_Anunciante
+JOIN Anuncio a ON a.idImovel = i.idImovel
+JOIN Proposta p ON p.idAnuncio = a.idAnuncio
+JOIN AvaliacaoFinal af ON af.idProposta = p.idProposta
+GROUP BY pa.idPerfil_Anunciante, u.nome;
+
+--MOSTRA AS CASAS DISPONIVEIS
+-- COM ENDERECO, DETALHES DO IMOVEL, E DA CASA
+CREATE OR REPLACE VIEW vw_casas_disponiveis AS
+SELECT 
+    i.idImovel,
+    i.nome,
+    i.valor,
+    i.descricao,
+    i.qntQuartos,
+    i.qntBanheiros,
+    i.metragem,
+    e.cidade,
+    e.estado,
+    c.isCondominio,
+    c.qntPavimentos,
+    c.totalTerreno,
+    c.quintal
+FROM Imovel i
+JOIN Endereco e ON i.idImovel = e.idImovel
+JOIN Casa c ON i.idImovel = c.idImovel
+WHERE i.isDisponivel = TRUE
+ORDER BY i.valor DESC;
+
+--MOSTRA OS APARTAMENTOS DISPONIVEIS
+-- COM ENDERECO, DETALHES DO IMOVEL, E DO APARTAMENTO
+CREATE OR REPLACE VIEW vw_apartamentos_disponiveis AS
+SELECT 
+    i.idImovel,
+    i.nome,
+    i.valor,
+    i.descricao,
+    i.qntQuartos,
+    i.qntBanheiros,
+    i.metragem,
+    e.cidade,
+    e.estado,
+    ap.andar,
+    ap.elevador,
+    ap.descricaoLazer,
+    ap.valorCondominio,
+    ap.garagem
+FROM Imovel i
+JOIN Endereco e ON i.idImovel = e.idImovel
+JOIN Apartamento ap ON i.idImovel = ap.idImovel
+WHERE i.isDisponivel = TRUE
+ORDER BY i.valor DESC;
+
+--MOSTRA OS COMERCIAIS DISPONIVEIS
+-- COM ENDERECO, DETALHES DO IMOVEL, E DO COMERCIAL
+CREATE OR REPLACE VIEW vw_comerciais_disponiveis AS
+SELECT 
+    i.idImovel,
+    i.nome,
+    i.valor,
+    i.descricao,
+    i.qntQuartos,
+    i.qntBanheiros,
+    i.metragem,
+    e.cidade,
+    e.estado,
+    co.qntSalas,
+    co.elevador,
+    co.almoxarifado,
+    co.estacionamento
+FROM Imovel i
+JOIN Endereco e ON i.idImovel = e.idImovel
+JOIN Comercial co ON i.idImovel = co.idImovel
+WHERE i.isDisponivel = TRUE
+ORDER BY i.valor DESC;
+
+--CONTRATOS ATIVOS
+CREATE OR REPLACE VIEW vw_contratos_ativos AS
+SELECT 
+    c.idContrato,
+    c.tipoContrato,
+    c.valorFinal,
+    c.dataFinalizacao,
+    p.dataProposta,
+    i.nome AS nome_imovel,
+    u.nome AS nome_cliente
+FROM Contrato c
+JOIN Proposta p ON c.idProposta = p.idProposta
+JOIN Anuncio a ON p.idAnuncio = a.idAnuncio
+JOIN Imovel i ON a.idImovel = i.idImovel
+JOIN Perfil_Cliente pc ON p.idcliente = pc.idperfil_cliente
+JOIN Usuario u ON pc.idusuario = u.idusuario
+WHERE c.isFinalizado = FALSE;
+
+--DETALHES DOS CONTRATOS
+CREATE OR REPLACE VIEW vw_detalhes_contrato AS
+SELECT 
+  c.idContrato,
+  c.tipoContrato,
+  c.valorFinal,
+  c.porcentagemAnunciante,
+  c.isFinalizado,
+  p.dataProposta,
+  i.nome AS nome_imovel,
+  pa.tipoAnunciante,
+  u.nome AS nome_anunciante,
+  uc.nome AS nome_cliente
+FROM Contrato c
+JOIN Proposta p ON c.idProposta = p.idProposta
+JOIN Anuncio a ON p.idAnuncio = a.idAnuncio
+JOIN Imovel i ON a.idImovel = i.idImovel
+JOIN Perfil_Anunciante pa ON i.idAnunciante = pa.idPerfil_Anunciante
+JOIN Usuario u ON pa.idusuario = u.idusuario
+JOIN Perfil_Cliente pc ON p.idcliente = pc.idperfil_cliente
+JOIN Usuario uc ON pc.idusuario = uc.idusuario;
+
+--IMOVEIS ORDENADOS POR ANUNCIANTES
+CREATE OR REPLACE VIEW vw_imoveis_por_anunciante AS
+SELECT 
+    pa.idPerfil_Anunciante,
+    u.nome AS nome_anunciante,
+    i.idImovel,
+    i.nome AS nome_imovel,
+    i.valor,
+    i.metragem,
+    i.isDisponivel
+FROM Perfil_Anunciante pa
+JOIN Usuario u ON pa.idusuario = u.idusuario
+JOIN Imovel i ON i.idAnunciante = pa.idPerfil_Anunciante;
+
+--DETALHES DOS CONTRATOS FINALIZADOS
+--COM INFO DAS PARTES ENVOLVIDAS
+CREATE OR REPLACE VIEW vw_partes_contrato_finalizados AS
+SELECT
+    c.idContrato,
+    c.tipoContrato,
+    c.valorFinal,
+    c.dataFinalizacao,
+
+    -- Dados legais formais do contrato
+    pt.nomeComprador,
+    pt.conjugeComprador,
+    pt.nomeConjComprador,
+    pt.nomeProprietario,
+    pt.conjugeProprietario,
+    pt.nomeConjProprietario
+
+FROM Contrato c
+JOIN Proposta p ON c.idProposta = p.idProposta
+JOIN Anuncio a ON p.idAnuncio = a.idAnuncio
+JOIN Perfil_Cliente cli ON p.idCliente = cli.idPerfil_Cliente
+JOIN Usuario u_cli ON cli.idUsuario = u_cli.idUsuario
+JOIN Perfil_Anunciante anu ON a.idAnunciante = anu.idPerfil_Anunciante
+JOIN Usuario u_anu ON anu.idUsuario = u_anu.idUsuario
+JOIN Partes pt ON pt.idContrato = c.idContrato
+WHERE c.isFinalizado = TRUE;
+
+--PROPOSTAS 
+--COM INFO DO ANUNCIANTE, CLIENTE, ANUNCIO E IMOVEL
+CREATE OR REPLACE VIEW vw_propostas_completa AS
+SELECT
+    p.idProposta,
+    p.valorInicial,
+    p.valorProposta,
+    p.dataProposta,
+    p.observacoes,
+    p.isAceita,
+    u_cli.nome AS nomeCliente,
+    u_anu.nome AS nomeAnunciante,
+    i.idImovel,
+    i.valor AS valorImovel,
+    i.metragem,
+    i.tipoimovel,
+    e.cidade,
+    a.idAnuncio,
+    a.tipoAnuncio,
+    a.dataAnuncio
+
+FROM Proposta p
+JOIN Anuncio a ON p.idAnuncio = a.idAnuncio
+JOIN Imovel i ON a.idImovel = i.idImovel
+JOIN Endereco e ON i.idImovel = e.idImovel
+JOIN Perfil_Cliente cli ON p.idCliente = cli.idPerfil_Cliente
+JOIN Usuario u_cli ON cli.idUsuario = u_cli.idUsuario
+JOIN Perfil_Anunciante anu ON a.idAnunciante = anu.idPerfil_Anunciante
+JOIN Usuario u_anu ON anu.idUsuario = u_anu.idUsuario;
